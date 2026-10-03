@@ -19,6 +19,17 @@
 #include <vector>
 using namespace std;
 
+namespace {
+
+size_t JoinedSize(const vector<StringPiece>& list) {
+  size_t size = list.size() - 1;
+  for (const StringPiece& piece : list)
+    size += piece.len_;
+  return size;
+}
+
+}  // namespace
+
 vector<StringPiece> SplitStringPiece(StringPiece input, char sep) {
   vector<StringPiece> elems;
   elems.reserve(count(input.begin(), input.end(), sep) + 1);
@@ -45,13 +56,7 @@ string JoinStringPiece(const vector<StringPiece>& list, char sep) {
 
   string ret;
 
-  {
-    size_t cap = list.size() - 1;
-    for (size_t i = 0; i < list.size(); ++i) {
-      cap += list[i].len_;
-    }
-    ret.reserve(cap);
-  }
+  ret.reserve(JoinedSize(list));
 
   for (size_t i = 0; i < list.size(); ++i) {
     if (i != 0) {

@@ -73,22 +73,19 @@ class Writer(object):
     ) -> None:
         self._line('rule %s' % name)
         self.variable('command', command, indent=1)
-        if description:
-            self.variable('description', description, indent=1)
-        if depfile:
-            self.variable('depfile', depfile, indent=1)
-        if generator:
-            self.variable('generator', '1', indent=1)
-        if pool:
-            self.variable('pool', pool, indent=1)
-        if restat:
-            self.variable('restat', '1', indent=1)
-        if rspfile:
-            self.variable('rspfile', rspfile, indent=1)
-        if rspfile_content:
-            self.variable('rspfile_content', rspfile_content, indent=1)
-        if deps:
-            self.variable('deps', deps, indent=1)
+        bindings = (
+            ('description', description),
+            ('depfile', depfile),
+            ('generator', '1' if generator else None),
+            ('pool', pool),
+            ('restat', '1' if restat else None),
+            ('rspfile', rspfile),
+            ('rspfile_content', rspfile_content),
+            ('deps', deps),
+        )
+        for key, value in bindings:
+            if value:
+                self.variable(key, value, indent=1)
 
     def build(
         self,
@@ -161,6 +158,25 @@ class Writer(object):
             dollar_index -= 1
         return dollar_count
 
+    def _find_wrap_space(self, text: str, leading_space: str) -> int:
+        available_space = self.width - len(leading_space) - len(' $')
+        space = available_space
+        while True:
+            space = text.rfind(' ', 0, space)
+            if (space < 0 or
+                self._count_dollars_before_index(text, space) % 2 == 0):
+                break
+
+        if space < 0:
+            # No such space; just use the first unescaped space we can find.
+            space = available_space - 1
+            while True:
+                space = text.find(' ', space + 1)
+                if (space < 0 or
+                    self._count_dollars_before_index(text, space) % 2 == 0):
+                    break
+        return space
+
     def _line(self, text: str, indent: int = 0) -> None:
         """Write 'text' word-wrapped at self.width characters."""
         leading_space = '  ' * indent
@@ -169,22 +185,7 @@ class Writer(object):
 
             # Find the rightmost space that would obey our width constraint and
             # that's not an escaped space.
-            available_space = self.width - len(leading_space) - len(' $')
-            space = available_space
-            while True:
-                space = text.rfind(' ', 0, space)
-                if (space < 0 or
-                    self._count_dollars_before_index(text, space) % 2 == 0):
-                    break
-
-            if space < 0:
-                # No such space; just use the first unescaped space we can find.
-                space = available_space - 1
-                while True:
-                    space = text.find(' ', space + 1)
-                    if (space < 0 or
-                        self._count_dollars_before_index(text, space) % 2 == 0):
-                        break
+            space = self._find_wrap_space(text, leading_space)
             if space < 0:
                 # Give up on breaking.
                 break

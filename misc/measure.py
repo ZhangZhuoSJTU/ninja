@@ -24,16 +24,20 @@ from typing import Union, List
 
 devnull = open('/dev/null', 'w')
 
+def sample_command(cmd: Union[str, List[str]]) -> float:
+    start = time.time()
+    subprocess.call(cmd, stdout=devnull, stderr=devnull)
+    end = time.time()
+    return (end - start) * 1000
+
+
 def run(cmd: Union[str, List[str]], repeat: int = 10) -> None:
     print('sampling:', end=' ')
     sys.stdout.flush()
 
     samples = []
     for _ in range(repeat):
-        start = time.time()
-        subprocess.call(cmd, stdout=devnull, stderr=devnull)
-        end = time.time()
-        dt = (end - start) * 1000
+        dt = sample_command(cmd)
         print('%dms' % int(dt), end=' ')
         sys.stdout.flush()
         samples.append(dt)

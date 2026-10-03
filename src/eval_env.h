@@ -21,6 +21,14 @@
 #include <vector>
 
 #include "string_piece.h"
+// Rebuild all translation units when changing this storage setting.
+#ifndef NINJA_USE_TEXT_ARENA
+#define NINJA_USE_TEXT_ARENA 0
+#endif
+
+#if NINJA_USE_TEXT_ARENA
+#include "eval_string_arena.h"
+#endif
 
 struct Rule;
 
@@ -40,7 +48,11 @@ struct EvalString {
   /// @return The string with variables not expanded.
   std::string Unparse() const;
 
+#if NINJA_USE_TEXT_ARENA
+  void Clear();
+#else
   void Clear() { parsed_.clear(); single_token_.clear(); }
+#endif
   bool empty() const { return parsed_.empty() && single_token_.empty(); }
 
   void AddText(StringPiece text);
@@ -52,7 +64,16 @@ struct EvalString {
 
 private:
   enum TokenType { RAW, SPECIAL };
+#if NINJA_USE_TEXT_ARENA
+  typedef std::vector<std::pair<EvalStringArena::Ref, TokenType> > TokenList;
+  EvalStringArena::Ref StoreText(StringPiece text);
+  std::string ReadText(const EvalStringArena::Ref& ref) const;
+
+  // Copies share append-only storage; token lists remain independent.
+  std::shared_ptr<EvalStringArena> arena_;
+#else
   typedef std::vector<std::pair<std::string, TokenType> > TokenList;
+#endif
   TokenList parsed_;
 
   // If we hold only a single RAW token, then we keep it here instead of

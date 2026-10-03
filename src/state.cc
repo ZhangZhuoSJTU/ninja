@@ -16,6 +16,7 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include<iostream>
 
 #include "edit_distance.h"
 #include "graph.h"
@@ -65,6 +66,7 @@ Pool State::kDefaultPool("", 0);
 Pool State::kConsolePool("console", 1);
 
 State::State() {
+  node_storage_.reserve(RESERVE);
   bindings_.AddRule(Rule::Phony());
   AddPool(&kDefaultPool);
   AddPool(&kConsolePool);
@@ -96,7 +98,14 @@ Node* State::GetNode(StringPiece path, uint64_t slash_bits) {
   Node* node = LookupNode(path);
   if (node)
     return node;
-  node = new Node(path.AsString(), slash_bits);
+  if (next_node_in_vector_)  {
+    node_storage_.emplace_back(path.AsString(), slash_bits);
+    node = &node_storage_.back();
+  } else {
+    _node_storage_.emplace_back(path.AsString(), slash_bits);
+    node = &_node_storage_.back();
+  }
+  next_node_in_vector_ = !next_node_in_vector_;
   paths_[node->path()] = node;
   return node;
 }

@@ -22,18 +22,20 @@ namespace {
 
 TEST(State, Basic) {
   State state;
-
+  Rule* rule = new Rule("cat");
+  Edge* edge = state.AddEdge(rule);
   EvalString command;
+  
   command.AddText("cat ");
   command.AddSpecial("in");
   command.AddText(" > ");
   command.AddSpecial("out");
 
-  Rule* rule = new Rule("cat");
+  
   rule->AddBinding("command", command);
   state.bindings_.AddRule(std::unique_ptr<Rule>(rule));
 
-  Edge* edge = state.AddEdge(rule);
+  
   state.AddIn(edge, "in1", 0);
   state.AddIn(edge, "in2", 0);
   state.AddOut(edge, "out", 0, nullptr);

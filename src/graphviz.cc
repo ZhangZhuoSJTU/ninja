@@ -50,6 +50,26 @@ void GraphViz::AddTarget(Node* node) {
     }
   }
 
+  PrintEdge(edge);
+
+  for (vector<Node*>::iterator in = edge->inputs_.begin();
+       in != edge->inputs_.end(); ++in) {
+    AddTarget(*in);
+  }
+}
+
+void GraphViz::Start() {
+  printf("digraph ninja {\n");
+  printf("rankdir=\"LR\"\n");
+  printf("node [fontsize=10, shape=box, height=0.25]\n");
+  printf("edge [fontsize=10]\n");
+}
+
+void GraphViz::Finish() {
+  printf("}\n");
+}
+
+void GraphViz::PrintEdge(Edge* edge) {
   if (edge->inputs_.size() == 1 && edge->outputs_.size() == 1) {
     // Can draw simply.
     // Note extra space before label text -- this is cosmetic and feels
@@ -71,20 +91,4 @@ void GraphViz::AddTarget(Node* node) {
       printf("\"%p\" -> \"%p\" [arrowhead=none%s]\n", (*in), edge, order_only);
     }
   }
-
-  for (vector<Node*>::iterator in = edge->inputs_.begin();
-       in != edge->inputs_.end(); ++in) {
-    AddTarget(*in);
-  }
-}
-
-void GraphViz::Start() {
-  printf("digraph ninja {\n");
-  printf("rankdir=\"LR\"\n");
-  printf("node [fontsize=10, shape=box, height=0.25]\n");
-  printf("edge [fontsize=10]\n");
-}
-
-void GraphViz::Finish() {
-  printf("}\n");
 }

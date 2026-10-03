@@ -96,59 +96,6 @@ bool Plan::AddTarget(const Node* target, string* err) {
   return AddSubTarget(target, NULL, err, NULL);
 }
 
-bool Plan::AddSubTarget(const Node* node, const Node* dependent, string* err,
-                        set<Edge*>* dyndep_walk) {
-  Edge* edge = node->in_edge();
-  if (!edge) {
-     // Leaf node, this can be either a regular input from the manifest
-     // (e.g. a source file), or an implicit input from a depfile or dyndep
-     // file. In the first case, a dirty flag means the file is missing,
-     // and the build should stop. In the second, do not do anything here
-     // since there is no producing edge to add to the plan.
-     if (node->dirty() && !node->generated_by_dep_loader()) {
-       string referenced;
-       if (dependent)
-         referenced = ", needed by '" + dependent->path() + "',";
-       *err = "'" + node->path() + "'" + referenced +
-              " missing and no known rule to make it";
-     }
-     return false;
-  }
-
-  if (edge->outputs_ready())
-    return false;  // Don't need to do anything.
-
-  // If an entry in want_ does not already exist for edge, create an entry which
-  // maps to kWantNothing, indicating that we do not want to build this entry itself.
-  pair<map<Edge*, Want>::iterator, bool> want_ins =
-    want_.insert(make_pair(edge, kWantNothing));
-  Want& want = want_ins.first->second;
-
-  if (dyndep_walk && want == kWantToFinish)
-    return false;  // Don't need to do anything with already-scheduled edge.
-
-  // If we do need to build edge and we haven't already marked it as wanted,
-  // mark it now.
-  if (node->dirty() && want == kWantNothing) {
-    want = kWantToStart;
-    EdgeWanted(edge);
-  }
-
-  if (dyndep_walk)
-    dyndep_walk->insert(edge);
-
-  if (!want_ins.second)
-    return true;  // We've already processed the inputs.
-
-  for (vector<Node*>::iterator i = edge->inputs_.begin();
-       i != edge->inputs_.end(); ++i) {
-    if (!AddSubTarget(*i, node, err, dyndep_walk) && !err->empty())
-      return false;
-  }
-
-  return true;
-}
-
 void Plan::EdgeWanted(const Edge* edge) {
   ++wanted_edges_;
   if (!edge->is_phony()) {
@@ -196,251 +143,6 @@ void Plan::ScheduleWork(map<Edge*, Want>::iterator want_e) {
     pool->EdgeScheduled(*edge);
     ready_.push(edge);
   }
-}
-
-bool Plan::EdgeFinished(Edge* edge, EdgeResult result, string* err) {
-  map<Edge*, Want>::iterator e = want_.find(edge);
-  assert(e != want_.end());
-  bool directly_wanted = e->second != kWantNothing;
-
-  // See if this job frees up any delayed jobs.
-  if (directly_wanted)
-    edge->pool()->EdgeFinished(*edge);
-  edge->pool()->RetrieveReadyEdges(&ready_);
-
-  // Release job slot if needed.
-  if (builder_ && builder_->jobserver_.get())
-    builder_->jobserver_->Release(std::move(edge->job_slot_));
-
-  // The rest of this function only applies to successful commands.
-  if (result != kEdgeSucceeded)
-    return true;
-
-  if (directly_wanted)
-    --wanted_edges_;
-  want_.erase(e);
-  edge->outputs_ready_ = true;
-
-  // Check off any nodes we were waiting for with this edge.
-  for (vector<Node*>::iterator o = edge->outputs_.begin();
-       o != edge->outputs_.end(); ++o) {
-    if (!NodeFinished(*o, err))
-      return false;
-  }
-  return true;
-}
-
-bool Plan::NodeFinished(Node* node, string* err) {
-  // If this node provides dyndep info, load it now.
-  if (node->dyndep_pending()) {
-    assert(builder_ && "dyndep requires Plan to have a Builder");
-    // Load the now-clean dyndep file.  This will also update the
-    // build plan and schedule any new work that is ready.
-    return builder_->LoadDyndeps(node, err);
-  }
-
-  // See if we we want any edges from this node.
-  for (vector<Edge*>::const_iterator oe = node->out_edges().begin();
-       oe != node->out_edges().end(); ++oe) {
-    map<Edge*, Want>::iterator want_e = want_.find(*oe);
-    if (want_e == want_.end())
-      continue;
-
-    // See if the edge is now ready.
-    if (!EdgeMaybeReady(want_e, err))
-      return false;
-  }
-  return true;
-}
-
-bool Plan::EdgeMaybeReady(map<Edge*, Want>::iterator want_e, string* err) {
-  Edge* edge = want_e->first;
-  if (edge->AllInputsReady()) {
-    if (want_e->second != kWantNothing) {
-      ScheduleWork(want_e);
-    } else {
-      // We do not need to build this edge, but we might need to build one of
-      // its dependents.
-      if (!EdgeFinished(edge, kEdgeSucceeded, err))
-        return false;
-    }
-  }
-  return true;
-}
-
-bool Plan::CleanNode(DependencyScan* scan, Node* node, string* err) {
-  node->set_dirty(false);
-
-  for (vector<Edge*>::const_iterator oe = node->out_edges().begin();
-       oe != node->out_edges().end(); ++oe) {
-    // Don't process edges that we don't actually want.
-    map<Edge*, Want>::iterator want_e = want_.find(*oe);
-    if (want_e == want_.end() || want_e->second == kWantNothing)
-      continue;
-
-    // Don't attempt to clean an edge if it failed to load deps.
-    if ((*oe)->deps_missing_)
-      continue;
-
-    // If all non-order-only inputs for this edge are now clean,
-    // we might have changed the dirty state of the outputs.
-    vector<Node*>::iterator
-        begin = (*oe)->inputs_.begin(),
-        end = (*oe)->inputs_.end() - (*oe)->order_only_deps_;
-#if __cplusplus < 201703L
-#define MEM_FN mem_fun
-#else
-#define MEM_FN mem_fn  // mem_fun was removed in C++17.
-#endif
-    if (find_if(begin, end, MEM_FN(&Node::dirty)) == end) {
-      // Recompute most_recent_input.
-      Node* most_recent_input = NULL;
-      for (vector<Node*>::iterator i = begin; i != end; ++i) {
-        if (!most_recent_input || (*i)->mtime() > most_recent_input->mtime())
-          most_recent_input = *i;
-      }
-
-      // Now, this edge is dirty if any of the outputs are dirty.
-      // If the edge isn't dirty, clean the outputs and mark the edge as not
-      // wanted.
-      bool outputs_dirty = false;
-      if (!scan->RecomputeOutputsDirty(*oe, most_recent_input,
-                                       &outputs_dirty, err)) {
-        return false;
-      }
-      if (!outputs_dirty) {
-        for (vector<Node*>::iterator o = (*oe)->outputs_.begin();
-             o != (*oe)->outputs_.end(); ++o) {
-          if (!CleanNode(scan, *o, err))
-            return false;
-        }
-
-        want_e->second = kWantNothing;
-        --wanted_edges_;
-        if (!(*oe)->is_phony()) {
-          --command_edges_;
-          if (builder_)
-            builder_->status_->EdgeRemovedFromPlan(*oe);
-        }
-      }
-    }
-  }
-  return true;
-}
-
-bool Plan::DyndepsLoaded(DependencyScan* scan, const Node* node,
-                         const DyndepFile& ddf, string* err) {
-  // Recompute the dirty state of all our direct and indirect dependents now
-  // that our dyndep information has been loaded.
-  if (!RefreshDyndepDependents(scan, node, err))
-    return false;
-
-  // We loaded dyndep information for those out_edges of the dyndep node that
-  // specify the node in a dyndep binding, but they may not be in the plan.
-  // Starting with those already in the plan, walk newly-reachable portion
-  // of the graph through the dyndep-discovered dependencies.
-
-  // Find edges in the the build plan for which we have new dyndep info.
-  std::vector<DyndepFile::const_iterator> dyndep_roots;
-  for (DyndepFile::const_iterator oe = ddf.begin(); oe != ddf.end(); ++oe) {
-    Edge* edge = oe->first;
-
-    // If the edge outputs are ready we do not need to consider it here.
-    if (edge->outputs_ready())
-      continue;
-
-    map<Edge*, Want>::iterator want_e = want_.find(edge);
-
-    // If the edge has not been encountered before then nothing already in the
-    // plan depends on it so we do not need to consider the edge yet either.
-    if (want_e == want_.end())
-      continue;
-
-    // This edge is already in the plan so queue it for the walk.
-    dyndep_roots.push_back(oe);
-  }
-
-  // Walk dyndep-discovered portion of the graph to add it to the build plan.
-  std::set<Edge*> dyndep_walk;
-  for (std::vector<DyndepFile::const_iterator>::iterator
-       oei = dyndep_roots.begin(); oei != dyndep_roots.end(); ++oei) {
-    DyndepFile::const_iterator oe = *oei;
-    for (vector<Node*>::const_iterator i = oe->second.implicit_inputs_.begin();
-         i != oe->second.implicit_inputs_.end(); ++i) {
-      if (!AddSubTarget(*i, oe->first->outputs_[0], err, &dyndep_walk) &&
-          !err->empty())
-        return false;
-    }
-  }
-
-  // Add out edges from this node that are in the plan (just as
-  // Plan::NodeFinished would have without taking the dyndep code path).
-  for (vector<Edge*>::const_iterator oe = node->out_edges().begin();
-       oe != node->out_edges().end(); ++oe) {
-    map<Edge*, Want>::iterator want_e = want_.find(*oe);
-    if (want_e == want_.end())
-      continue;
-    dyndep_walk.insert(want_e->first);
-  }
-
-  // See if any encountered edges are now ready.
-  for (set<Edge*>::iterator wi = dyndep_walk.begin();
-       wi != dyndep_walk.end(); ++wi) {
-    map<Edge*, Want>::iterator want_e = want_.find(*wi);
-    if (want_e == want_.end())
-      continue;
-    if (!EdgeMaybeReady(want_e, err))
-      return false;
-  }
-
-  return true;
-}
-
-bool Plan::RefreshDyndepDependents(DependencyScan* scan, const Node* node,
-                                   string* err) {
-  // Collect the transitive closure of dependents and mark their edges
-  // as not yet visited by RecomputeDirty.
-  set<Node*> dependents;
-  UnmarkDependents(node, &dependents);
-
-  // Update the dirty state of all dependents and check if their edges
-  // have become wanted.
-  for (set<Node*>::iterator i = dependents.begin();
-       i != dependents.end(); ++i) {
-    Node* n = *i;
-
-    // Check if this dependent node is now dirty.  Also checks for new cycles.
-    std::vector<Node*> validation_nodes;
-    if (!scan->RecomputeDirty(n, &validation_nodes, err))
-      return false;
-
-    // Add any validation nodes found during RecomputeDirty as new top level
-    // targets.
-    for (std::vector<Node*>::iterator v = validation_nodes.begin();
-         v != validation_nodes.end(); ++v) {
-      if (Edge* in_edge = (*v)->in_edge()) {
-        if (!in_edge->outputs_ready() &&
-            !AddTarget(*v, err)) {
-          return false;
-        }
-      }
-    }
-    if (!n->dirty())
-      continue;
-
-    // This edge was encountered before.  However, we may not have wanted to
-    // build it if the outputs were not known to be dirty.  With dyndep
-    // information an output is now known to be dirty, so we want the edge.
-    Edge* edge = n->in_edge();
-    assert(edge && !edge->outputs_ready());
-    map<Edge*, Want>::iterator want_e = want_.find(edge);
-    assert(want_e != want_.end());
-    if (want_e->second == kWantNothing) {
-      want_e->second = kWantToStart;
-      EdgeWanted(edge);
-    }
-  }
-  return true;
 }
 
 void Plan::UnmarkDependents(const Node* node, set<Node*>* dependents) {
@@ -604,6 +306,304 @@ void Plan::Dump() const {
   printf("ready: %d\n", (int)ready_.size());
 }
 
+bool Plan::RefreshDyndepDependents(DependencyScan* scan, const Node* node,
+                                   string* err) {
+  // Collect the transitive closure of dependents and mark their edges
+  // as not yet visited by RecomputeDirty.
+  set<Node*> dependents;
+  UnmarkDependents(node, &dependents);
+
+  // Update the dirty state of all dependents and check if their edges
+  // have become wanted.
+  for (set<Node*>::iterator i = dependents.begin();
+       i != dependents.end(); ++i) {
+    Node* n = *i;
+
+    // Check if this dependent node is now dirty.  Also checks for new cycles.
+    std::vector<Node*> validation_nodes;
+    if (!scan->RecomputeDirty(n, &validation_nodes, err))
+      return false;
+
+    // Add any validation nodes found during RecomputeDirty as new top level
+    // targets.
+    for (std::vector<Node*>::iterator v = validation_nodes.begin();
+         v != validation_nodes.end(); ++v) {
+      if (Edge* in_edge = (*v)->in_edge()) {
+        if (!in_edge->outputs_ready() &&
+            !AddTarget(*v, err)) {
+          return false;
+        }
+      }
+    }
+    if (!n->dirty())
+      continue;
+
+    // This edge was encountered before.  However, we may not have wanted to
+    // build it if the outputs were not known to be dirty.  With dyndep
+    // information an output is now known to be dirty, so we want the edge.
+    Edge* edge = n->in_edge();
+    assert(edge && !edge->outputs_ready());
+    map<Edge*, Want>::iterator want_e = want_.find(edge);
+    assert(want_e != want_.end());
+    if (want_e->second == kWantNothing) {
+      want_e->second = kWantToStart;
+      EdgeWanted(edge);
+    }
+  }
+  return true;
+}
+
+bool Plan::DyndepsLoaded(DependencyScan* scan, const Node* node,
+                         const DyndepFile& ddf, string* err) {
+  // Recompute the dirty state of all our direct and indirect dependents now
+  // that our dyndep information has been loaded.
+  if (!RefreshDyndepDependents(scan, node, err))
+    return false;
+
+  // We loaded dyndep information for those out_edges of the dyndep node that
+  // specify the node in a dyndep binding, but they may not be in the plan.
+  // Starting with those already in the plan, walk newly-reachable portion
+  // of the graph through the dyndep-discovered dependencies.
+
+  // Find edges in the the build plan for which we have new dyndep info.
+  std::vector<DyndepFile::const_iterator> dyndep_roots;
+  for (DyndepFile::const_iterator oe = ddf.begin(); oe != ddf.end(); ++oe) {
+    Edge* edge = oe->first;
+
+    // If the edge outputs are ready we do not need to consider it here.
+    if (edge->outputs_ready())
+      continue;
+
+    map<Edge*, Want>::iterator want_e = want_.find(edge);
+
+    // If the edge has not been encountered before then nothing already in the
+    // plan depends on it so we do not need to consider the edge yet either.
+    if (want_e == want_.end())
+      continue;
+
+    // This edge is already in the plan so queue it for the walk.
+    dyndep_roots.push_back(oe);
+  }
+
+  // Walk dyndep-discovered portion of the graph to add it to the build plan.
+  std::set<Edge*> dyndep_walk;
+  for (std::vector<DyndepFile::const_iterator>::iterator
+       oei = dyndep_roots.begin(); oei != dyndep_roots.end(); ++oei) {
+    DyndepFile::const_iterator oe = *oei;
+    for (vector<Node*>::const_iterator i = oe->second.implicit_inputs_.begin();
+         i != oe->second.implicit_inputs_.end(); ++i) {
+      if (!AddSubTarget(*i, oe->first->outputs_[0], err, &dyndep_walk) &&
+          !err->empty())
+        return false;
+    }
+  }
+
+  // Add out edges from this node that are in the plan (just as
+  // Plan::NodeFinished would have without taking the dyndep code path).
+  for (vector<Edge*>::const_iterator oe = node->out_edges().begin();
+       oe != node->out_edges().end(); ++oe) {
+    map<Edge*, Want>::iterator want_e = want_.find(*oe);
+    if (want_e == want_.end())
+      continue;
+    dyndep_walk.insert(want_e->first);
+  }
+
+  // See if any encountered edges are now ready.
+  for (set<Edge*>::iterator wi = dyndep_walk.begin();
+       wi != dyndep_walk.end(); ++wi) {
+    map<Edge*, Want>::iterator want_e = want_.find(*wi);
+    if (want_e == want_.end())
+      continue;
+    if (!EdgeMaybeReady(want_e, err))
+      return false;
+  }
+
+  return true;
+}
+
+bool Plan::CleanNode(DependencyScan* scan, Node* node, string* err) {
+  node->set_dirty(false);
+
+  for (vector<Edge*>::const_iterator oe = node->out_edges().begin();
+       oe != node->out_edges().end(); ++oe) {
+    // Don't process edges that we don't actually want.
+    map<Edge*, Want>::iterator want_e = want_.find(*oe);
+    if (want_e == want_.end() || want_e->second == kWantNothing)
+      continue;
+
+    // Don't attempt to clean an edge if it failed to load deps.
+    if ((*oe)->deps_missing_)
+      continue;
+
+    // If all non-order-only inputs for this edge are now clean,
+    // we might have changed the dirty state of the outputs.
+    vector<Node*>::iterator
+        begin = (*oe)->inputs_.begin(),
+        end = (*oe)->inputs_.end() - (*oe)->order_only_deps_;
+#if __cplusplus < 201703L
+#define MEM_FN mem_fun
+#else
+#define MEM_FN mem_fn  // mem_fun was removed in C++17.
+#endif
+    if (find_if(begin, end, MEM_FN(&Node::dirty)) == end) {
+      // Recompute most_recent_input.
+      Node* most_recent_input = NULL;
+      for (vector<Node*>::iterator i = begin; i != end; ++i) {
+        if (!most_recent_input || (*i)->mtime() > most_recent_input->mtime())
+          most_recent_input = *i;
+      }
+
+      // Now, this edge is dirty if any of the outputs are dirty.
+      // If the edge isn't dirty, clean the outputs and mark the edge as not
+      // wanted.
+      bool outputs_dirty = false;
+      if (!scan->RecomputeOutputsDirty(*oe, most_recent_input,
+                                       &outputs_dirty, err)) {
+        return false;
+      }
+      if (!outputs_dirty) {
+        for (vector<Node*>::iterator o = (*oe)->outputs_.begin();
+             o != (*oe)->outputs_.end(); ++o) {
+          if (!CleanNode(scan, *o, err))
+            return false;
+        }
+
+        want_e->second = kWantNothing;
+        --wanted_edges_;
+        if (!(*oe)->is_phony()) {
+          --command_edges_;
+          if (builder_)
+            builder_->status_->EdgeRemovedFromPlan(*oe);
+        }
+      }
+    }
+  }
+  return true;
+}
+
+bool Plan::AddSubTarget(const Node* node, const Node* dependent, string* err,
+                        set<Edge*>* dyndep_walk) {
+  Edge* edge = node->in_edge();
+  if (!edge) {
+     // Leaf node, this can be either a regular input from the manifest
+     // (e.g. a source file), or an implicit input from a depfile or dyndep
+     // file. In the first case, a dirty flag means the file is missing,
+     // and the build should stop. In the second, do not do anything here
+     // since there is no producing edge to add to the plan.
+     if (node->dirty() && !node->generated_by_dep_loader()) {
+       string referenced;
+       if (dependent)
+         referenced = ", needed by '" + dependent->path() + "',";
+       *err = "'" + node->path() + "'" + referenced +
+              " missing and no known rule to make it";
+     }
+     return false;
+  }
+
+  if (edge->outputs_ready())
+    return false;  // Don't need to do anything.
+
+  // If an entry in want_ does not already exist for edge, create an entry which
+  // maps to kWantNothing, indicating that we do not want to build this entry itself.
+  pair<map<Edge*, Want>::iterator, bool> want_ins =
+    want_.insert(make_pair(edge, kWantNothing));
+  Want& want = want_ins.first->second;
+
+  if (dyndep_walk && want == kWantToFinish)
+    return false;  // Don't need to do anything with already-scheduled edge.
+
+  // If we do need to build edge and we haven't already marked it as wanted,
+  // mark it now.
+  if (node->dirty() && want == kWantNothing) {
+    want = kWantToStart;
+    EdgeWanted(edge);
+  }
+
+  if (dyndep_walk)
+    dyndep_walk->insert(edge);
+
+  if (!want_ins.second)
+    return true;  // We've already processed the inputs.
+
+  for (vector<Node*>::iterator i = edge->inputs_.begin();
+       i != edge->inputs_.end(); ++i) {
+    if (!AddSubTarget(*i, node, err, dyndep_walk) && !err->empty())
+      return false;
+  }
+
+  return true;
+}
+
+bool Plan::NodeFinished(Node* node, string* err) {
+  // If this node provides dyndep info, load it now.
+  if (node->dyndep_pending()) {
+    assert(builder_ && "dyndep requires Plan to have a Builder");
+    // Load the now-clean dyndep file.  This will also update the
+    // build plan and schedule any new work that is ready.
+    return builder_->LoadDyndeps(node, err);
+  }
+
+  // See if we we want any edges from this node.
+  for (vector<Edge*>::const_iterator oe = node->out_edges().begin();
+       oe != node->out_edges().end(); ++oe) {
+    map<Edge*, Want>::iterator want_e = want_.find(*oe);
+    if (want_e == want_.end())
+      continue;
+
+    // See if the edge is now ready.
+    if (!EdgeMaybeReady(want_e, err))
+      return false;
+  }
+  return true;
+}
+
+bool Plan::EdgeFinished(Edge* edge, EdgeResult result, string* err) {
+  map<Edge*, Want>::iterator e = want_.find(edge);
+  assert(e != want_.end());
+  bool directly_wanted = e->second != kWantNothing;
+
+  // See if this job frees up any delayed jobs.
+  if (directly_wanted)
+    edge->pool()->EdgeFinished(*edge);
+  edge->pool()->RetrieveReadyEdges(&ready_);
+
+  // Release job slot if needed.
+  if (builder_ && builder_->jobserver_.get())
+    builder_->jobserver_->Release(std::move(edge->job_slot_));
+
+  // The rest of this function only applies to successful commands.
+  if (result != kEdgeSucceeded)
+    return true;
+
+  if (directly_wanted)
+    --wanted_edges_;
+  want_.erase(e);
+  edge->outputs_ready_ = true;
+
+  // Check off any nodes we were waiting for with this edge.
+  for (vector<Node*>::iterator o = edge->outputs_.begin();
+       o != edge->outputs_.end(); ++o) {
+    if (!NodeFinished(*o, err))
+      return false;
+  }
+  return true;
+}
+
+bool Plan::EdgeMaybeReady(map<Edge*, Want>::iterator want_e, string* err) {
+  Edge* edge = want_e->first;
+  if (edge->AllInputsReady()) {
+    if (want_e->second != kWantNothing) {
+      ScheduleWork(want_e);
+    } else {
+      // We do not need to build this edge, but we might need to build one of
+      // its dependents.
+      if (!EdgeFinished(edge, kEdgeSucceeded, err))
+        return false;
+    }
+  }
+  return true;
+}
+
 Builder::Builder(State* state, const BuildConfig& config, BuildLog* build_log,
                  DepsLog* deps_log, DiskInterface* disk_interface,
                  Status* status, int64_t start_time_millis)
@@ -622,40 +622,6 @@ Builder::Builder(State* state, const BuildConfig& config, BuildLog* build_log,
 Builder::~Builder() {
   Cleanup();
   status_->SetExplanations(nullptr);
-}
-
-void Builder::Cleanup() {
-  if (command_runner_.get()) {
-    vector<Edge*> active_edges = command_runner_->GetActiveEdges();
-    command_runner_->Abort();
-
-    for (vector<Edge*>::iterator e = active_edges.begin();
-         e != active_edges.end(); ++e) {
-      string depfile = (*e)->GetUnescapedDepfile();
-      for (vector<Node*>::iterator o = (*e)->outputs_.begin();
-           o != (*e)->outputs_.end(); ++o) {
-        // Only delete this output if it was actually modified.  This is
-        // important for things like the generator where we don't want to
-        // delete the manifest file if we can avoid it.  But if the rule
-        // uses a depfile, always delete.  (Consider the case where we
-        // need to rebuild an output because of a modified header file
-        // mentioned in a depfile, and the command touches its depfile
-        // but is interrupted before it touches its output file.)
-        string err;
-        TimeStamp new_mtime = disk_interface_->Stat((*o)->path(), &err);
-        if (new_mtime == -1)  // Log and ignore Stat() errors.
-          status_->Error("%s", err.c_str());
-        if (!depfile.empty() || (*o)->mtime() != new_mtime)
-          disk_interface_->RemoveFile((*o)->path());
-      }
-      if (!depfile.empty())
-        disk_interface_->RemoveFile(depfile);
-    }
-  }
-
-  string err;
-  if (disk_interface_->Stat(lock_file_path_, &err) > 0)
-    disk_interface_->RemoveFile(lock_file_path_);
 }
 
 Node* Builder::AddTarget(const string& name, string* err) {
@@ -818,6 +784,60 @@ ExitStatus Builder::Build(string* err) {
 
   status_->BuildFinished();
   return ExitSuccess;
+}
+
+bool Builder::LoadDyndeps(Node* node, string* err) {
+  // Load the dyndep information provided by this node.
+  DyndepFile ddf;
+  if (!scan_.LoadDyndeps(node, &ddf, err))
+    return false;
+
+  // Update the build plan to account for dyndep modifications to the graph.
+  if (!plan_.DyndepsLoaded(&scan_, node, ddf, err))
+    return false;
+
+  return true;
+}
+
+void Builder::SetFailureCode(ExitStatus code) {
+  // ExitSuccess should not overwrite any error
+  if (code != ExitSuccess) {
+    exit_code_ = code;
+  }
+}
+
+void Builder::Cleanup() {
+  if (command_runner_.get()) {
+    vector<Edge*> active_edges = command_runner_->GetActiveEdges();
+    command_runner_->Abort();
+
+    for (vector<Edge*>::iterator e = active_edges.begin();
+         e != active_edges.end(); ++e) {
+      string depfile = (*e)->GetUnescapedDepfile();
+      for (vector<Node*>::iterator o = (*e)->outputs_.begin();
+           o != (*e)->outputs_.end(); ++o) {
+        // Only delete this output if it was actually modified.  This is
+        // important for things like the generator where we don't want to
+        // delete the manifest file if we can avoid it.  But if the rule
+        // uses a depfile, always delete.  (Consider the case where we
+        // need to rebuild an output because of a modified header file
+        // mentioned in a depfile, and the command touches its depfile
+        // but is interrupted before it touches its output file.)
+        string err;
+        TimeStamp new_mtime = disk_interface_->Stat((*o)->path(), &err);
+        if (new_mtime == -1)  // Log and ignore Stat() errors.
+          status_->Error("%s", err.c_str());
+        if (!depfile.empty() || (*o)->mtime() != new_mtime)
+          disk_interface_->RemoveFile((*o)->path());
+      }
+      if (!depfile.empty())
+        disk_interface_->RemoveFile(depfile);
+    }
+  }
+
+  string err;
+  if (disk_interface_->Stat(lock_file_path_, &err) > 0)
+    disk_interface_->RemoveFile(lock_file_path_);
 }
 
 bool Builder::StartEdge(Edge* edge, string* err) {
@@ -1045,24 +1065,4 @@ bool Builder::ExtractDeps(CommandRunner::Result* result,
   }
 
   return true;
-}
-
-bool Builder::LoadDyndeps(Node* node, string* err) {
-  // Load the dyndep information provided by this node.
-  DyndepFile ddf;
-  if (!scan_.LoadDyndeps(node, &ddf, err))
-    return false;
-
-  // Update the build plan to account for dyndep modifications to the graph.
-  if (!plan_.DyndepsLoaded(&scan_, node, ddf, err))
-    return false;
-
-  return true;
-}
-
-void Builder::SetFailureCode(ExitStatus code) {
-  // ExitSuccess should not overwrite any error
-  if (code != ExitSuccess) {
-    exit_code_ = code;
-  }
 }

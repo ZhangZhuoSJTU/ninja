@@ -33,6 +33,16 @@ struct Cleaner {
           const BuildConfig& config,
           DiskInterface* disk_interface);
 
+  /// Clean all built files, except for files created by generator rules.
+  /// @param generator If set, also clean files created by generator rules.
+  /// @return non-zero if an error occurs.
+  int CleanAll(bool generator = false);
+
+  /// Clean the files produced by previous builds that are no longer in the
+  /// manifest.
+  /// @return non-zero if an error occurs.
+  int CleanDead(const BuildLog::Entries& entries);
+
   /// Clean the given @a target and all the file built for it.
   /// @return non-zero if an error occurs.
   int CleanTarget(Node* target);
@@ -43,11 +53,6 @@ struct Cleaner {
   /// @return non-zero if an error occurs.
   int CleanTargets(int target_count, char* targets[]);
 
-  /// Clean all built files, except for files created by generator rules.
-  /// @param generator If set, also clean files created by generator rules.
-  /// @return non-zero if an error occurs.
-  int CleanAll(bool generator = false);
-
   /// Clean all the file built with the given rule @a rule.
   /// @return non-zero if an error occurs.
   int CleanRule(const Rule* rule);
@@ -57,11 +62,6 @@ struct Cleaner {
   /// Clean the file produced by the given @a rules.
   /// @return non-zero if an error occurs.
   int CleanRules(int rule_count, char* rules[]);
-  /// Clean the files produced by previous builds that are no longer in the
-  /// manifest.
-  /// @return non-zero if an error occurs.
-  int CleanDead(const BuildLog::Entries& entries);
-
   /// @return the number of file cleaned.
   int cleaned_files_count() const {
     return cleaned_files_count_;

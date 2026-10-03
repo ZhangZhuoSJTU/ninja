@@ -205,6 +205,100 @@ struct LineReader {
   char* line_end_;
 };
 
+bool BuildLog::WriteEntry(FILE* f, const LogEntry& entry) {
+  return fprintf(f, "%d\t%d\t%" PRId64 "\t%s\t%" PRIx64 "\n",
+          entry.start_time, entry.end_time, entry.mtime,
+          entry.output.c_str(), entry.command_hash) > 0;
+}
+
+bool BuildLog::Recompact(const std::string& path, const BuildLogUser& user,
+                         std::string* err) {
+  METRIC_RECORD(".ninja_log recompact");
+
+  Close();
+  std::string temp_path = path + ".recompact";
+  FILE* f = fopen(temp_path.c_str(), "wb");
+  if (!f) {
+    *err = strerror(errno);
+    return false;
+  }
+
+  if (fprintf(f, kFileSignature, kCurrentVersion) < 0) {
+    *err = strerror(errno);
+    fclose(f);
+    return false;
+  }
+
+  std::vector<StringPiece> dead_outputs;
+  for (const auto& pair : entries_) {
+    if (user.IsPathDead(pair.first)) {
+      dead_outputs.push_back(pair.first);
+      continue;
+    }
+
+    if (!WriteEntry(f, *pair.second)) {
+      *err = strerror(errno);
+      fclose(f);
+      return false;
+    }
+  }
+
+  for (StringPiece output : dead_outputs)
+    entries_.erase(output);
+
+  fclose(f);
+
+  return ReplaceContent(path, temp_path, err);
+}
+
+bool BuildLog::Restat(const StringPiece path,
+                      const DiskInterface& disk_interface,
+                      const int output_count, char** outputs,
+                      std::string* const err) {
+  METRIC_RECORD(".ninja_log restat");
+
+  Close();
+  std::string temp_path = path.AsString() + ".restat";
+  FILE* f = fopen(temp_path.c_str(), "wb");
+  if (!f) {
+    *err = strerror(errno);
+    return false;
+  }
+
+  if (fprintf(f, kFileSignature, kCurrentVersion) < 0) {
+    *err = strerror(errno);
+    fclose(f);
+    return false;
+  }
+  for (auto& pair : entries_) {
+    bool skip = output_count > 0;
+    for (int j = 0; j < output_count; ++j) {
+      if (pair.second->output == outputs[j]) {
+        skip = false;
+        break;
+      }
+    }
+    if (!skip) {
+      const TimeStamp mtime = disk_interface.Stat(pair.second->output, err);
+      if (mtime == -1) {
+        fclose(f);
+        return false;
+      }
+      pair.second->mtime = mtime;
+    }
+
+    if (!WriteEntry(f, *pair.second)) {
+      *err = strerror(errno);
+      fclose(f);
+      return false;
+    }
+  }
+
+  fclose(f);
+
+  return ReplaceContent(path.AsString(), temp_path, err);
+}
+
 LoadStatus BuildLog::Load(const std::string& path, std::string* err) {
   METRIC_RECORD(".ninja_log load");
   FILE* file = fopen(path.c_str(), "r");
@@ -329,98 +423,4 @@ BuildLog::LogEntry* BuildLog::LookupByOutput(const std::string& path) {
   if (i != entries_.end())
     return i->second.get();
   return NULL;
-}
-
-bool BuildLog::WriteEntry(FILE* f, const LogEntry& entry) {
-  return fprintf(f, "%d\t%d\t%" PRId64 "\t%s\t%" PRIx64 "\n",
-          entry.start_time, entry.end_time, entry.mtime,
-          entry.output.c_str(), entry.command_hash) > 0;
-}
-
-bool BuildLog::Recompact(const std::string& path, const BuildLogUser& user,
-                         std::string* err) {
-  METRIC_RECORD(".ninja_log recompact");
-
-  Close();
-  std::string temp_path = path + ".recompact";
-  FILE* f = fopen(temp_path.c_str(), "wb");
-  if (!f) {
-    *err = strerror(errno);
-    return false;
-  }
-
-  if (fprintf(f, kFileSignature, kCurrentVersion) < 0) {
-    *err = strerror(errno);
-    fclose(f);
-    return false;
-  }
-
-  std::vector<StringPiece> dead_outputs;
-  for (const auto& pair : entries_) {
-    if (user.IsPathDead(pair.first)) {
-      dead_outputs.push_back(pair.first);
-      continue;
-    }
-
-    if (!WriteEntry(f, *pair.second)) {
-      *err = strerror(errno);
-      fclose(f);
-      return false;
-    }
-  }
-
-  for (StringPiece output : dead_outputs)
-    entries_.erase(output);
-
-  fclose(f);
-
-  return ReplaceContent(path, temp_path, err);
-}
-
-bool BuildLog::Restat(const StringPiece path,
-                      const DiskInterface& disk_interface,
-                      const int output_count, char** outputs,
-                      std::string* const err) {
-  METRIC_RECORD(".ninja_log restat");
-
-  Close();
-  std::string temp_path = path.AsString() + ".restat";
-  FILE* f = fopen(temp_path.c_str(), "wb");
-  if (!f) {
-    *err = strerror(errno);
-    return false;
-  }
-
-  if (fprintf(f, kFileSignature, kCurrentVersion) < 0) {
-    *err = strerror(errno);
-    fclose(f);
-    return false;
-  }
-  for (auto& pair : entries_) {
-    bool skip = output_count > 0;
-    for (int j = 0; j < output_count; ++j) {
-      if (pair.second->output == outputs[j]) {
-        skip = false;
-        break;
-      }
-    }
-    if (!skip) {
-      const TimeStamp mtime = disk_interface.Stat(pair.second->output, err);
-      if (mtime == -1) {
-        fclose(f);
-        return false;
-      }
-      pair.second->mtime = mtime;
-    }
-
-    if (!WriteEntry(f, *pair.second)) {
-      *err = strerror(errno);
-      fclose(f);
-      return false;
-    }
-  }
-
-  fclose(f);
-
-  return ReplaceContent(path.AsString(), temp_path, err);
 }

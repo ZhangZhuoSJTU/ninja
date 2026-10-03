@@ -108,6 +108,104 @@ string BindingEnv::LookupWithFallback(const string& var,
   return "";
 }
 
+#if NINJA_USE_TEXT_ARENA
+
+void EvalString::Clear() {
+  parsed_.clear();
+  single_token_.clear();
+  arena_.reset();
+}
+
+EvalStringArena::Ref EvalString::StoreText(StringPiece text) {
+  if (!arena_)
+    arena_ = std::make_shared<EvalStringArena>();
+  return arena_->Store(text);
+}
+
+string EvalString::ReadText(const EvalStringArena::Ref& ref) const {
+  assert(arena_);
+  return arena_->Read(ref);
+}
+
+string EvalString::Evaluate(Env* env) const {
+  if (parsed_.empty())
+    return single_token_;
+  string result;
+  for (const auto& token : parsed_) {
+    string text = ReadText(token.first);
+    if (token.second == RAW)
+      result.append(text);
+    else
+      result.append(env->LookupVariable(text));
+  }
+  return result;
+}
+
+void EvalString::AddText(StringPiece text) {
+  if (parsed_.empty()) {
+    if (text.size())
+      single_token_.append(text.str_, text.size());
+  } else if (parsed_.back().second == RAW) {
+    // Materialize before StoreText can grow the arena. Never overwrite
+    // existing bytes, since another EvalString may share them.
+    string combined = ReadText(parsed_.back().first);
+    if (text.size())
+      combined.append(text.str_, text.size());
+    auto replacement = StoreText(StringPiece(combined));
+    parsed_.back().first = replacement;
+  } else {
+    auto stored = StoreText(text);
+    parsed_.push_back(std::make_pair(stored, RAW));
+  }
+}
+
+void EvalString::AddSpecial(StringPiece text) {
+  if (parsed_.empty() && !single_token_.empty()) {
+    auto stored = StoreText(StringPiece(single_token_));
+    parsed_.push_back(std::make_pair(stored, RAW));
+    single_token_.clear();
+  }
+  auto stored = StoreText(text);
+  parsed_.push_back(std::make_pair(stored, SPECIAL));
+}
+
+string EvalString::Serialize() const {
+  string result;
+  if (parsed_.empty() && !single_token_.empty()) {
+    result.append("[");
+    result.append(single_token_);
+    result.append("]");
+  } else {
+    for (const auto& token : parsed_) {
+      result.append("[");
+      if (token.second == SPECIAL)
+        result.append("$");
+      result.append(ReadText(token.first));
+      result.append("]");
+    }
+  }
+  return result;
+}
+
+string EvalString::Unparse() const {
+  string result;
+  if (parsed_.empty() && !single_token_.empty()) {
+    result.append(single_token_);
+  } else {
+    for (const auto& token : parsed_) {
+      bool special = token.second == SPECIAL;
+      if (special)
+        result.append("${");
+      result.append(ReadText(token.first));
+      if (special)
+        result.append("}");
+    }
+  }
+  return result;
+}
+
+#else
+
 string EvalString::Evaluate(Env* env) const {
   if (parsed_.empty()) {
     return single_token_;
@@ -178,3 +276,5 @@ string EvalString::Unparse() const {
   }
   return result;
 }
+
+#endif  // NINJA_USE_TEXT_ARENA

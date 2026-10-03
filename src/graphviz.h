@@ -36,6 +36,9 @@ struct GraphViz {
   DyndepLoader dyndep_loader_;
   std::set<Node*> visited_nodes_;
   EdgeSet visited_edges_;
+
+ private:
+  void PrintEdge(Edge* edge);
 };
 
 #endif  // NINJA_GRAPHVIZ_H_

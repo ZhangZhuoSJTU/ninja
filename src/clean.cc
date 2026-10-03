@@ -35,72 +35,6 @@ Cleaner::Cleaner(State* state,
     status_(0) {
 }
 
-int Cleaner::RemoveFile(const string& path) {
-  return disk_interface_->RemoveFile(path);
-}
-
-bool Cleaner::FileExists(const string& path) {
-  string err;
-  TimeStamp mtime = disk_interface_->Stat(path, &err);
-  if (mtime == -1)
-    Error("%s", err.c_str());
-  return mtime > 0;  // Treat Stat() errors as "file does not exist".
-}
-
-void Cleaner::Report(const string& path) {
-  ++cleaned_files_count_;
-  if (IsVerbose())
-    printf("Remove %s\n", path.c_str());
-}
-
-void Cleaner::Remove(const string& path) {
-  if (!IsAlreadyRemoved(path)) {
-    removed_.insert(path);
-    if (config_.dry_run) {
-      if (FileExists(path))
-        Report(path);
-    } else {
-      int ret = RemoveFile(path);
-      if (ret == 0)
-        Report(path);
-      else if (ret == -1)
-        status_ = 1;
-    }
-  }
-}
-
-bool Cleaner::IsAlreadyRemoved(const string& path) {
-  set<string>::iterator i = removed_.find(path);
-  return (i != removed_.end());
-}
-
-void Cleaner::RemoveEdgeFiles(Edge* edge) {
-  string depfile = edge->GetUnescapedDepfile();
-  if (!depfile.empty())
-    Remove(depfile);
-
-  string rspfile = edge->GetUnescapedRspfile();
-  if (!rspfile.empty())
-    Remove(rspfile);
-}
-
-void Cleaner::PrintHeader() {
-  if (config_.verbosity == BuildConfig::QUIET)
-    return;
-  printf("Cleaning...");
-  if (IsVerbose())
-    printf("\n");
-  else
-    printf(" ");
-  fflush(stdout);
-}
-
-void Cleaner::PrintFooter() {
-  if (config_.verbosity == BuildConfig::QUIET)
-    return;
-  printf("%d files.\n", cleaned_files_count_);
-}
-
 int Cleaner::CleanAll(bool generator) {
   Reset();
   PrintHeader();
@@ -145,27 +79,6 @@ int Cleaner::CleanDead(const BuildLog::Entries& entries) {
   }
   PrintFooter();
   return status_;
-}
-
-void Cleaner::DoCleanTarget(Node* target) {
-  if (Edge* e = target->in_edge()) {
-    // Do not try to remove phony targets
-    if (!e->is_phony()) {
-      Remove(target->path());
-      RemoveEdgeFiles(e);
-    }
-    for (vector<Node*>::iterator n = e->inputs_.begin(); n != e->inputs_.end();
-         ++n) {
-      Node* next = *n;
-      // call DoCleanTarget recursively if this node has not been visited
-      if (cleaned_.count(next) == 0) {
-        DoCleanTarget(next);
-      }
-    }
-  }
-
-  // mark this target to be cleaned already
-  cleaned_.insert(target);
 }
 
 int Cleaner::CleanTarget(Node* target) {
@@ -218,21 +131,6 @@ int Cleaner::CleanTargets(int target_count, char* targets[]) {
   }
   PrintFooter();
   return status_;
-}
-
-void Cleaner::DoCleanRule(const Rule* rule) {
-  assert(rule);
-
-  for (vector<Edge*>::iterator e = state_->edges_.begin();
-       e != state_->edges_.end(); ++e) {
-    if ((*e)->rule().name() == rule->name()) {
-      for (vector<Node*>::iterator out_node = (*e)->outputs_.begin();
-           out_node != (*e)->outputs_.end(); ++out_node) {
-        Remove((*out_node)->path());
-        RemoveEdgeFiles(*e);
-      }
-    }
-  }
 }
 
 int Cleaner::CleanRule(const Rule* rule) {
@@ -299,6 +197,108 @@ void Cleaner::LoadDyndeps() {
       // We clean as much of the graph as we know.
       std::string err;
       dyndep_loader_.LoadDyndeps(dyndep, &err);
+    }
+  }
+}
+
+int Cleaner::RemoveFile(const string& path) {
+  return disk_interface_->RemoveFile(path);
+}
+
+bool Cleaner::FileExists(const string& path) {
+  string err;
+  TimeStamp mtime = disk_interface_->Stat(path, &err);
+  if (mtime == -1)
+    Error("%s", err.c_str());
+  return mtime > 0;  // Treat Stat() errors as "file does not exist".
+}
+
+void Cleaner::Report(const string& path) {
+  ++cleaned_files_count_;
+  if (IsVerbose())
+    printf("Remove %s\n", path.c_str());
+}
+
+void Cleaner::Remove(const string& path) {
+  if (!IsAlreadyRemoved(path)) {
+    removed_.insert(path);
+    if (config_.dry_run) {
+      if (FileExists(path))
+        Report(path);
+    } else {
+      int ret = RemoveFile(path);
+      if (ret == 0)
+        Report(path);
+      else if (ret == -1)
+        status_ = 1;
+    }
+  }
+}
+
+bool Cleaner::IsAlreadyRemoved(const string& path) {
+  set<string>::iterator i = removed_.find(path);
+  return (i != removed_.end());
+}
+
+void Cleaner::RemoveEdgeFiles(Edge* edge) {
+  string depfile = edge->GetUnescapedDepfile();
+  if (!depfile.empty())
+    Remove(depfile);
+
+  string rspfile = edge->GetUnescapedRspfile();
+  if (!rspfile.empty())
+    Remove(rspfile);
+}
+
+void Cleaner::PrintHeader() {
+  if (config_.verbosity == BuildConfig::QUIET)
+    return;
+  printf("Cleaning...");
+  if (IsVerbose())
+    printf("\n");
+  else
+    printf(" ");
+  fflush(stdout);
+}
+
+void Cleaner::PrintFooter() {
+  if (config_.verbosity == BuildConfig::QUIET)
+    return;
+  printf("%d files.\n", cleaned_files_count_);
+}
+
+void Cleaner::DoCleanTarget(Node* target) {
+  if (Edge* e = target->in_edge()) {
+    // Do not try to remove phony targets
+    if (!e->is_phony()) {
+      Remove(target->path());
+      RemoveEdgeFiles(e);
+    }
+    for (vector<Node*>::iterator n = e->inputs_.begin(); n != e->inputs_.end();
+         ++n) {
+      Node* next = *n;
+      // call DoCleanTarget recursively if this node has not been visited
+      if (cleaned_.count(next) == 0) {
+        DoCleanTarget(next);
+      }
+    }
+  }
+
+  // mark this target to be cleaned already
+  cleaned_.insert(target);
+}
+
+void Cleaner::DoCleanRule(const Rule* rule) {
+  assert(rule);
+
+  for (vector<Edge*>::iterator e = state_->edges_.begin();
+       e != state_->edges_.end(); ++e) {
+    if ((*e)->rule().name() == rule->name()) {
+      for (vector<Node*>::iterator out_node = (*e)->outputs_.begin();
+           out_node != (*e)->outputs_.end(); ++out_node) {
+        Remove((*out_node)->path());
+        RemoveEdgeFiles(*e);
+      }
     }
   }
 }

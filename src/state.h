@@ -24,10 +24,15 @@
 #include "graph.h"
 #include "hash_map.h"
 #include "util.h"
+#include <deque>
 
 struct Edge;
 struct Node;
 struct Rule;
+
+#ifndef RESERVE
+#define RESERVE 1024
+#endif
 
 /// A pool for delayed edges.
 /// Pools are scoped to a State. Edges within a State will share Pools. A Pool
@@ -126,6 +131,10 @@ struct State {
   /// @param error where to write the error message if somethings went wrong.
   std::vector<Node*> RootNodes(std::string* error) const;
   std::vector<Node*> DefaultNodes(std::string* error) const;
+
+  std::vector<Node> node_storage_;
+  std::deque<Node> _node_storage_;
+  bool next_node_in_vector_ = true;
 
   /// Mapping of path -> Node.
   typedef ExternalStringHashMap<Node*>::Type Paths;

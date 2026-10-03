@@ -23,26 +23,38 @@ std::string EncodeJSONString(const std::string& in) {
   out.reserve(in.length() * 1.2);
   for (std::string::const_iterator it = in.begin(); it != in.end(); ++it) {
     char c = *it;
-    if (c == '\b')
-      out += "\\b";
-    else if (c == '\f')
-      out += "\\f";
-    else if (c == '\n')
-      out += "\\n";
-    else if (c == '\r')
-      out += "\\r";
-    else if (c == '\t')
-      out += "\\t";
-    else if (0x0 <= c && c < 0x20) {
-      out += "\\u00";
-      out += hex_digits[c >> 4];
-      out += hex_digits[c & 0xf];
-    } else if (c == '\\')
-      out += "\\\\";
-    else if (c == '\"')
-      out += "\\\"";
-    else
-      out += c;
+    switch (c) {
+      case '\b':
+        out += "\\b";
+        break;
+      case '\f':
+        out += "\\f";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      case '\\':
+        out += "\\\\";
+        break;
+      case '"':
+        out += "\\\"";
+        break;
+      default:
+        if (0x0 <= c && c < 0x20) {
+          out += "\\u00";
+          out += hex_digits[c >> 4];
+          out += hex_digits[c & 0xf];
+        } else {
+          out += c;
+        }
+        break;
+    }
   }
   return out;
 }

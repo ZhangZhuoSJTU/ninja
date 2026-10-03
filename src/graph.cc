@@ -79,6 +79,161 @@ bool DependencyScan::RecomputeDirty(Node* initial_node,
   return true;
 }
 
+bool DependencyScan::LoadDyndeps(Node* node, string* err) const {
+  return dyndep_loader_.LoadDyndeps(node, err);
+}
+
+bool DependencyScan::LoadDyndeps(Node* node, DyndepFile* ddf,
+                                 string* err) const {
+  return dyndep_loader_.LoadDyndeps(node, ddf, err);
+}
+
+bool DependencyScan::VerifyDAG(Node* node, vector<Node*>* stack, string* err) {
+  Edge* edge = node->in_edge();
+  assert(edge != NULL);
+
+  // If we have no temporary mark on the edge then we do not yet have a cycle.
+  if (edge->mark_ != Edge::VisitInStack)
+    return true;
+
+  // We have this edge earlier in the call stack.  Find it.
+  vector<Node*>::iterator start = stack->begin();
+  while (start != stack->end() && (*start)->in_edge() != edge)
+    ++start;
+  assert(start != stack->end());
+
+  // Make the cycle clear by reporting its start as the node at its end
+  // instead of some other output of the starting edge.  For example,
+  // running 'ninja b' on
+  //   build a b: cat c
+  //   build c: cat a
+  // should report a -> c -> a instead of b -> c -> a.
+  *start = node;
+
+  // Construct the error message rejecting the cycle.
+  *err = "dependency cycle: ";
+  for (vector<Node*>::const_iterator i = start; i != stack->end(); ++i) {
+    err->append((*i)->path());
+    err->append(" -> ");
+  }
+  err->append((*start)->path());
+
+  if ((start + 1) == stack->end() && edge->maybe_phonycycle_diagnostic()) {
+    // The manifest parser would have filtered out the self-referencing
+    // input if it were not configured to allow the error.
+    err->append(" [-w phonycycle=err]");
+  }
+
+  return false;
+}
+
+bool DependencyScan::RecomputeOutputDirty(const Edge* edge,
+                                          const Node* most_recent_input,
+                                          const string& command,
+                                          Node* output) {
+  if (edge->is_phony()) {
+    // Phony edges don't write any output.  Outputs are only dirty if
+    // there are no inputs and we're missing the output.
+    if (edge->inputs_.empty() && !output->exists()) {
+      explanations_.Record(
+          output, "output %s of phony edge with no inputs doesn't exist",
+          output->path().c_str());
+      return true;
+    }
+
+    // Update the mtime with the newest input. Dependents can thus call mtime()
+    // on the fake node and get the latest mtime of the dependencies
+    if (most_recent_input) {
+      output->UpdatePhonyMtime(most_recent_input->mtime());
+    }
+
+    // Phony edges are clean, nothing to do
+    return false;
+  }
+
+  // Dirty if we're missing the output.
+  if (!output->exists()) {
+    explanations_.Record(output, "output %s doesn't exist",
+                         output->path().c_str());
+    return true;
+  }
+
+  BuildLog::LogEntry* entry = 0;
+
+  // If this is a restat rule, we may have cleaned the output in a
+  // previous run and stored the command start time in the build log.
+  // We don't want to consider a restat rule's outputs as dirty unless
+  // an input changed since the last run, so we'll skip checking the
+  // output file's actual mtime and simply check the recorded mtime from
+  // the log against the most recent input's mtime (see below)
+  bool used_restat = false;
+  if (edge->GetBindingBool("restat") && build_log() &&
+      (entry = build_log()->LookupByOutput(output->path()))) {
+    used_restat = true;
+  }
+
+  // Dirty if the output is older than the input.
+  if (!used_restat && most_recent_input && output->mtime() < most_recent_input->mtime()) {
+    explanations_.Record(output,
+                         "output %s older than most recent input %s "
+                         "(%" PRId64 " vs %" PRId64 ")",
+                         output->path().c_str(),
+                         most_recent_input->path().c_str(), output->mtime(),
+                         most_recent_input->mtime());
+    return true;
+  }
+
+  if (build_log()) {
+    bool generator = edge->GetBindingBool("generator");
+    if (entry || (entry = build_log()->LookupByOutput(output->path()))) {
+      if (!generator &&
+          BuildLog::LogEntry::HashCommand(command) != entry->command_hash) {
+        // May also be dirty due to the command changing since the last build.
+        // But if this is a generator rule, the command changing does not make us
+        // dirty.
+        explanations_.Record(output, "command line changed for %s",
+                             output->path().c_str());
+        return true;
+      }
+      if (most_recent_input && entry->mtime < most_recent_input->mtime()) {
+        // May also be dirty due to the mtime in the log being older than the
+        // mtime of the most recent input.  This can occur even when the mtime
+        // on disk is newer if a previous run wrote to the output file but
+        // exited with an error or was interrupted. If this was a restat rule,
+        // then we only check the recorded mtime against the most recent input
+        // mtime and ignore the actual output's mtime above.
+        explanations_.Record(
+            output,
+            "recorded mtime of %s older than most recent input %s (%" PRId64
+            " vs %" PRId64 ")",
+            output->path().c_str(), most_recent_input->path().c_str(),
+            entry->mtime, most_recent_input->mtime());
+        return true;
+      }
+    }
+    if (!entry && !generator) {
+      explanations_.Record(output, "command line not found in log for %s",
+                           output->path().c_str());
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool DependencyScan::RecomputeOutputsDirty(Edge* edge, Node* most_recent_input,
+                                           bool* outputs_dirty, string* err) {
+  string command = edge->EvaluateCommand(/*incl_rsp_file=*/true);
+  for (vector<Node*>::iterator o = edge->outputs_.begin();
+       o != edge->outputs_.end(); ++o) {
+    if (RecomputeOutputDirty(edge, most_recent_input, command, *o)) {
+      *outputs_dirty = true;
+      return true;
+    }
+  }
+  return true;
+}
+
 bool DependencyScan::RecomputeNodeDirty(Node* node, std::vector<Node*>* stack,
                                         std::vector<Node*>* validation_nodes,
                                         string* err) {
@@ -224,161 +379,6 @@ bool DependencyScan::RecomputeNodeDirty(Node* node, std::vector<Node*>* stack,
   stack->pop_back();
 
   return true;
-}
-
-bool DependencyScan::VerifyDAG(Node* node, vector<Node*>* stack, string* err) {
-  Edge* edge = node->in_edge();
-  assert(edge != NULL);
-
-  // If we have no temporary mark on the edge then we do not yet have a cycle.
-  if (edge->mark_ != Edge::VisitInStack)
-    return true;
-
-  // We have this edge earlier in the call stack.  Find it.
-  vector<Node*>::iterator start = stack->begin();
-  while (start != stack->end() && (*start)->in_edge() != edge)
-    ++start;
-  assert(start != stack->end());
-
-  // Make the cycle clear by reporting its start as the node at its end
-  // instead of some other output of the starting edge.  For example,
-  // running 'ninja b' on
-  //   build a b: cat c
-  //   build c: cat a
-  // should report a -> c -> a instead of b -> c -> a.
-  *start = node;
-
-  // Construct the error message rejecting the cycle.
-  *err = "dependency cycle: ";
-  for (vector<Node*>::const_iterator i = start; i != stack->end(); ++i) {
-    err->append((*i)->path());
-    err->append(" -> ");
-  }
-  err->append((*start)->path());
-
-  if ((start + 1) == stack->end() && edge->maybe_phonycycle_diagnostic()) {
-    // The manifest parser would have filtered out the self-referencing
-    // input if it were not configured to allow the error.
-    err->append(" [-w phonycycle=err]");
-  }
-
-  return false;
-}
-
-bool DependencyScan::RecomputeOutputsDirty(Edge* edge, Node* most_recent_input,
-                                           bool* outputs_dirty, string* err) {
-  string command = edge->EvaluateCommand(/*incl_rsp_file=*/true);
-  for (vector<Node*>::iterator o = edge->outputs_.begin();
-       o != edge->outputs_.end(); ++o) {
-    if (RecomputeOutputDirty(edge, most_recent_input, command, *o)) {
-      *outputs_dirty = true;
-      return true;
-    }
-  }
-  return true;
-}
-
-bool DependencyScan::RecomputeOutputDirty(const Edge* edge,
-                                          const Node* most_recent_input,
-                                          const string& command,
-                                          Node* output) {
-  if (edge->is_phony()) {
-    // Phony edges don't write any output.  Outputs are only dirty if
-    // there are no inputs and we're missing the output.
-    if (edge->inputs_.empty() && !output->exists()) {
-      explanations_.Record(
-          output, "output %s of phony edge with no inputs doesn't exist",
-          output->path().c_str());
-      return true;
-    }
-
-    // Update the mtime with the newest input. Dependents can thus call mtime()
-    // on the fake node and get the latest mtime of the dependencies
-    if (most_recent_input) {
-      output->UpdatePhonyMtime(most_recent_input->mtime());
-    }
-
-    // Phony edges are clean, nothing to do
-    return false;
-  }
-
-  // Dirty if we're missing the output.
-  if (!output->exists()) {
-    explanations_.Record(output, "output %s doesn't exist",
-                         output->path().c_str());
-    return true;
-  }
-
-  BuildLog::LogEntry* entry = 0;
-
-  // If this is a restat rule, we may have cleaned the output in a
-  // previous run and stored the command start time in the build log.
-  // We don't want to consider a restat rule's outputs as dirty unless
-  // an input changed since the last run, so we'll skip checking the
-  // output file's actual mtime and simply check the recorded mtime from
-  // the log against the most recent input's mtime (see below)
-  bool used_restat = false;
-  if (edge->GetBindingBool("restat") && build_log() &&
-      (entry = build_log()->LookupByOutput(output->path()))) {
-    used_restat = true;
-  }
-
-  // Dirty if the output is older than the input.
-  if (!used_restat && most_recent_input && output->mtime() < most_recent_input->mtime()) {
-    explanations_.Record(output,
-                         "output %s older than most recent input %s "
-                         "(%" PRId64 " vs %" PRId64 ")",
-                         output->path().c_str(),
-                         most_recent_input->path().c_str(), output->mtime(),
-                         most_recent_input->mtime());
-    return true;
-  }
-
-  if (build_log()) {
-    bool generator = edge->GetBindingBool("generator");
-    if (entry || (entry = build_log()->LookupByOutput(output->path()))) {
-      if (!generator &&
-          BuildLog::LogEntry::HashCommand(command) != entry->command_hash) {
-        // May also be dirty due to the command changing since the last build.
-        // But if this is a generator rule, the command changing does not make us
-        // dirty.
-        explanations_.Record(output, "command line changed for %s",
-                             output->path().c_str());
-        return true;
-      }
-      if (most_recent_input && entry->mtime < most_recent_input->mtime()) {
-        // May also be dirty due to the mtime in the log being older than the
-        // mtime of the most recent input.  This can occur even when the mtime
-        // on disk is newer if a previous run wrote to the output file but
-        // exited with an error or was interrupted. If this was a restat rule,
-        // then we only check the recorded mtime against the most recent input
-        // mtime and ignore the actual output's mtime above.
-        explanations_.Record(
-            output,
-            "recorded mtime of %s older than most recent input %s (%" PRId64
-            " vs %" PRId64 ")",
-            output->path().c_str(), most_recent_input->path().c_str(),
-            entry->mtime, most_recent_input->mtime());
-        return true;
-      }
-    }
-    if (!entry && !generator) {
-      explanations_.Record(output, "command line not found in log for %s",
-                           output->path().c_str());
-      return true;
-    }
-  }
-
-  return false;
-}
-
-bool DependencyScan::LoadDyndeps(Node* node, string* err) const {
-  return dyndep_loader_.LoadDyndeps(node, err);
-}
-
-bool DependencyScan::LoadDyndeps(Node* node, DyndepFile* ddf,
-                                 string* err) const {
-  return dyndep_loader_.LoadDyndeps(node, ddf, err);
 }
 
 bool Edge::AllInputsReady() const {

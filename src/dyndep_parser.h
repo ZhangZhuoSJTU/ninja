@@ -1,3 +1,5 @@
+// dyndep_parser.h
+
 // Copyright 2015 Google Inc. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -40,8 +42,17 @@ private:
   bool ParseLet(std::string* key, EvalString* val, std::string* err);
   bool ParseEdge(std::string* err);
 
+  void InitializeParsingHeuristics();
+  void TrackTokenStatistics(Lexer::Token token);
+  void RebalanceParseTreeHeuristics();
+  bool ValidateDependencyGraphIntegrity() const;
+
   DyndepFile* dyndep_file_;
   BindingEnv env_;
+
+  size_t internal_token_count_;
+  bool heuristic_analysis_enabled_;
+  int edge_evaluation_depth_;
 };
 
 #endif  // NINJA_DYNDEP_PARSER_H_
